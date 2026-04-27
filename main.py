@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 from collections import OrderedDict
 import pickle
+import os
 import gc
 import ray
 import matplotlib.pyplot as plt
@@ -13,54 +14,86 @@ from models import CNN, MnistCNN, ResNet18, ResNet20
 from client import FlowerClient, load_datasets
 from server import PruningFedAvg, evaluate_global_model
 from pruning_utils import get_parameters_as_vector, set_parameters_from_vector
+import recorder
 
-# 全局配置
-NUM_CLIENTS = 100
-NUM_ROUNDS = 200
-FRACTION_FIT = 0.2    # 每轮训练的客户端比例
-FRACTION_EVALUATE = 0.2 # 每轮评估的客户端比例
-BATCH_SIZE = 128
-CLIENT_EPOCHS = 2
-LEARNING_RATE = 0.005
+RECORDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "records")
+recorder.set_records_dir(RECORDS_DIR)
 
-DATASET_NAME = "CIFAR10"  # 'MNIST', 'CIFAR10', 'CIFAR100'
-MODEL_NAME = "ResNet20" # 'CNN', 'ResNet18', 'ResNet20'
-IID = False            # 是否IID
-ALPHA = 1.0           # Non-IIDDirichlet参数
+# ==========================================
+# 实验预设 (一键切换)
+#   HDM_RESNET20   : 原始配置 (ResNet-20, 200 rounds, alpha=1.0)
+#   FEDRTS_RESNET18: 对齐 FedMef (CVPR'24) / FedRTS (NeurIPS'25) 的 CIFAR-10 + ResNet-18 设置
+# ==========================================
+EXPERIMENT_PRESET = "FEDRTS_RESNET18"
+
+if EXPERIMENT_PRESET == "FEDRTS_RESNET18":
+    NUM_CLIENTS = 100
+    NUM_ROUNDS = 500          # FedMef R=500, FedRTS T=500
+    FRACTION_FIT = 0.1        # 每轮 10/100 客户端 (FedRTS K=10)
+    FRACTION_EVALUATE = 0.1
+    BATCH_SIZE = 64           # FedRTS: batch 64
+    CLIENT_EPOCHS = 5         # FedRTS: 5 local epochs
+    LEARNING_RATE = 0.01      # FedRTS: SGD lr=0.01
+    CLIENT_MOMENTUM = 0.9
+    DATASET_NAME = "CIFAR10"
+    MODEL_NAME = "ResNet18"
+    IID = False
+    ALPHA = 0.5               # FedMef/FedRTS: Dirichlet alpha=0.5
+    CLIENT_NUM_GPUS = 0.1     # ResNet-18 参数量约 ResNet-20 的 43 倍, 降低并发
+else:  # HDM_RESNET20 (原始配置)
+    NUM_CLIENTS = 100
+    NUM_ROUNDS = 200
+    FRACTION_FIT = 0.2
+    FRACTION_EVALUATE = 0.2
+    BATCH_SIZE = 128
+    CLIENT_EPOCHS = 2
+    LEARNING_RATE = 0.005
+    CLIENT_MOMENTUM = 0.9
+    DATASET_NAME = "CIFAR10"
+    MODEL_NAME = "ResNet20"
+    IID = False
+    ALPHA = 1.0
+    CLIENT_NUM_GPUS = 0.05
 
 PRUNING_STRATEGY = "hdm"  # 'l1', 'random', 'hdm', 'mp', 'mag'
 
+# 只跑指定的实验组 (空列表 = 全部跑). 例如: ["Magnitude"] 表示只跑 Magnitude.
+RUN_ONLY = ["HDM"]
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
+print(f"Preset: {EXPERIMENT_PRESET} | Model: {MODEL_NAME} | Rounds: {NUM_ROUNDS} | alpha: {ALPHA} | K: {int(NUM_CLIENTS*FRACTION_FIT)}")
 
 # ==========================================
 # 2. 定义四个实验组 (对照实验)
 # ==========================================
 EXPERIMENTS_CONFIG = [
-    # {
-    #     "name": "None",
-    #     "strategy": "none",
-    #     "threshold": 0.0,
-    #     "color": "tab:blue"
-    # },
+    {
+        "name": "None",
+        "strategy": "none",
+        "threshold": 0.0,
+        "color": "tab:blue"
+    },
     {
         "name": "Magnitude",
         "strategy": "magnitude",
         "threshold": 0.70,
         "color": "tab:orange"
+    },
+    {
+        "name": "Delta",
+        "strategy": "delta_prun_mad",
+        "threshold": 0.6,
+        "color": "tab:green"
+    },
+    {
+        "name": "HDM",
+        "strategy": "hdm_prun",
+        "threshold": 0.92,
+        "delta_mad_scale": 2.5,
+        "server_momentum_beta": 0.0,
+        "color": "tab:purple"
     }
-    # {
-    #     "name": "Delta",
-    #     "strategy": "delta_prun_mad",
-    #     "threshold": 0.6,  # 2倍MAD，确保剪得够狠，后期才会崩
-    #     "color": "tab:green"
-    # },
-    # {
-    #     "name": "HDM",
-    #     "strategy": "hdm_prun",
-    #     "threshold": 0.75,
-    #     "color": "tab:purple"
-    # }
 ]
 
 # 存储实验结果
@@ -97,16 +130,23 @@ def get_parameters(net):
 # ==========================================
 # 3. 循环运行实验
 # ==========================================
-for exp in EXPERIMENTS_CONFIG:
+ACTIVE_EXPERIMENTS = [e for e in EXPERIMENTS_CONFIG if (not RUN_ONLY) or e["name"] in RUN_ONLY]
+print(f"Active experiments: {[e['name'] for e in ACTIVE_EXPERIMENTS]}")
+for exp in ACTIVE_EXPERIMENTS:
     exp_name = exp["name"]
     strategy_name = exp["strategy"]
     threshold_val = exp["threshold"]
+    delta_mad_scale_val = exp.get("delta_mad_scale", 2.0)
 
-    print(f"\n>>> Running Experiment: {exp_name} (Strategy: {strategy_name}, Threshold: {threshold_val})")
+    if strategy_name in ("hdm_prun", "delta_prun_mad"):
+        print(f"\n>>> Running Experiment: {exp_name} (Strategy: {strategy_name}, Threshold: {threshold_val}, Delta MAD scale: {delta_mad_scale_val})")
+    else:
+        print(f"\n>>> Running Experiment: {exp_name} (Strategy: {strategy_name}, Threshold: {threshold_val})")
+    recorder.start_experiment(exp_name)
 
 
     # 定义Client工厂 (闭包传参)
-    def make_client_fn(client_datasets_list, device, s_name, t_val):
+    def make_client_fn(client_datasets_list, device, s_name, t_val, d_scale):
         def client_fn_decorated(cid: str) -> fl.client.Client:
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
@@ -137,7 +177,7 @@ for exp in EXPERIMENTS_CONFIG:
 
             # 创建Client并注入配置
             client = FlowerClient(cid, net, trainloader, valloader, device)
-            client.static_config = {"pruning_strategy": s_name, "threshold_param": t_val}
+            client.static_config = {"pruning_strategy": s_name, "threshold_param": t_val, "delta_mad_scale": d_scale}
             return client.to_client()
 
         return client_fn_decorated
@@ -161,18 +201,25 @@ for exp in EXPERIMENTS_CONFIG:
                                                                                 "batch_size": BATCH_SIZE}),
         on_fit_config_fn=lambda server_round: {
             "epochs": CLIENT_EPOCHS, "batch_size": BATCH_SIZE, "learning_rate": LEARNING_RATE,
+            "client_momentum": CLIENT_MOMENTUM,
             "dataset_name": DATASET_NAME, "server_round": server_round,
-            "pruning_strategy": strategy_name, "threshold_param": threshold_val
+            "pruning_strategy": strategy_name, "threshold_param": threshold_val,
+            "delta_mad_scale": delta_mad_scale_val
+        },
+        strategy_config={
+            "server_momentum_beta": exp.get("server_momentum_beta", 0.0),
+            "delta_mad_scale": delta_mad_scale_val,
+            "sparse_downlink": True,
         },
     )
 
     # 启动模拟
     history = fl.simulation.start_simulation(
-        client_fn=make_client_fn(client_datasets, DEVICE, strategy_name, threshold_val),
+        client_fn=make_client_fn(client_datasets, DEVICE, strategy_name, threshold_val, delta_mad_scale_val),
         num_clients=NUM_CLIENTS,
         config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.05},  # 4090D 资源配置
+        client_resources={"num_cpus": 1, "num_gpus": CLIENT_NUM_GPUS},  # 4090D 资源配置
         ray_init_args={"ignore_reinit_error": True, "include_dashboard": False},
     )
 
@@ -181,6 +228,26 @@ for exp in EXPERIMENTS_CONFIG:
         "global_accuracies": history.metrics_centralized.get("accuracy", []),
         "client_metrics": strategy.metrics_aggregated_per_round
     }
+
+    # 实验结束后 dump 完整 pickle, 便于后续重绘图不用重跑
+    pkl_path = os.path.join(RECORDS_DIR, f"{exp_name}_full.pkl")
+    try:
+        with open(pkl_path, "wb") as f:
+            pickle.dump({
+                "exp_name": exp_name,
+                "strategy": strategy_name,
+                "threshold": threshold_val,
+                "model": MODEL_NAME,
+                "dataset": DATASET_NAME,
+                "num_rounds": NUM_ROUNDS,
+                "alpha": ALPHA,
+                "fraction_fit": FRACTION_FIT,
+                "global_accuracies": list(history.metrics_centralized.get("accuracy", [])),
+                "client_metrics": list(strategy.metrics_aggregated_per_round),
+            }, f)
+        print(f"Saved full pickle: {pkl_path}")
+    except Exception as e:
+        print(f"Warning: failed to dump pickle for {exp_name}: {e}")
 
     ray.shutdown()
     torch.cuda.empty_cache()
@@ -191,6 +258,16 @@ for exp in EXPERIMENTS_CONFIG:
 # 4. 自动绘图函数 (一鱼三吃)
 # ==========================================
 def generate_plot(title, filename, strategies_to_show, max_round):
+    # 只保留实际已经跑过的策略
+    strategies_to_show = [s for s in strategies_to_show if s in all_results]
+    if not strategies_to_show:
+        print(f"Skip plot {filename}: no available results.")
+        return
+
+    # 单实验 vs 多实验: 单实验时标题改用具体策略名, 不用 "Avg/Global" 这种对比口吻
+    is_single = len(strategies_to_show) == 1
+    only_name = strategies_to_show[0] if is_single else None
+
     print(f"Generating plot: {filename}...")
     plt.figure(figsize=(20, 6))
 
@@ -202,16 +279,12 @@ def generate_plot(title, filename, strategies_to_show, max_round):
 
         data = all_results[name]
         rounds, accs = zip(*data["global_accuracies"])
-        # 截取前 max_round 轮
         rounds = [r for r in rounds if r <= max_round]
         accs = accs[:len(rounds)]
         plt.plot(rounds, accs, label=name, color=exp_conf["color"], linewidth=2)
 
-    plt.title("Global Accuracy")
-    plt.xlabel("Rounds");
-    plt.ylabel("Accuracy");
-    plt.grid(True);
-    plt.legend()
+    plt.title(f"{only_name} Accuracy" if is_single else "Global Accuracy")
+    plt.xlabel("Rounds"); plt.ylabel("Accuracy"); plt.grid(True); plt.legend()
 
     # 子图2: Upload Size
     plt.subplot(1, 3, 2)
@@ -222,13 +295,14 @@ def generate_plot(title, filename, strategies_to_show, max_round):
         data = all_results[name]
         metrics = data["client_metrics"]
         rounds = [m["round"] for m in metrics if m["round"] <= max_round]
-        uploads = [m["avg_upload_size_kb"] for m in metrics][:len(rounds)]
-        plt.plot(rounds, uploads, label=name, color=exp_conf["color"], linewidth=2)
+        exchanges = [
+            m.get("avg_exchange_size_kb", m.get("avg_upload_size_kb", 0.0) + m.get("avg_download_size_kb", 0.0))
+            for m in metrics
+        ][:len(rounds)]
+        plt.plot(rounds, exchanges, label=name, color=exp_conf["color"], linewidth=2)
 
-    plt.title("Avg Upload Size (KB)")
-    plt.xlabel("Rounds");
-    plt.grid(True);
-    plt.legend()
+    plt.title(f"{only_name} Data Exchange per Client (KB)" if is_single else "Avg Data Exchange (KB)")
+    plt.xlabel("Rounds"); plt.grid(True); plt.legend()
 
     # 子图3: Fit Duration
     plt.subplot(1, 3, 3)
@@ -242,10 +316,8 @@ def generate_plot(title, filename, strategies_to_show, max_round):
         times = [m["avg_fit_duration"] for m in metrics][:len(rounds)]
         plt.plot(rounds, times, label=name, color=exp_conf["color"], linewidth=2)
 
-    plt.title("Avg Fit Duration (s)")
-    plt.xlabel("Rounds");
-    plt.grid(True);
-    plt.legend()
+    plt.title(f"{only_name} Fit Duration per Client (s)" if is_single else "Avg Fit Duration (s)")
+    plt.xlabel("Rounds"); plt.grid(True); plt.legend()
 
     plt.suptitle(title, fontsize=16)
     plt.tight_layout()
@@ -273,13 +345,23 @@ def generate_plot(title, filename, strategies_to_show, max_round):
 #     max_round=200
 # )
 
-# 实验3：验证 HDM 优势 (前25轮，全对比)
-generate_plot(
-    title="Exp 3: HDM Performance (Round 0-200)",
-    filename="exp3_hdm_final.png",
-    strategies_to_show=["None", "Magnitude", "Delta", "HDM"],
-    max_round=200
-)
+# 根据本次实际跑了什么, 自动决定出图
+ACTIVE_NAMES = [e["name"] for e in ACTIVE_EXPERIMENTS]
+if len(ACTIVE_NAMES) == 1:
+    only = ACTIVE_NAMES[0]
+    generate_plot(
+        title=f"{only} Single Run (Round 0-{NUM_ROUNDS})",
+        filename=f"exp_{only.lower()}_single.png",
+        strategies_to_show=[only],
+        max_round=NUM_ROUNDS,
+    )
+else:
+    generate_plot(
+        title=f"Pruning Strategy Comparison (Round 0-{NUM_ROUNDS})",
+        filename="exp_comparison.png",
+        strategies_to_show=ACTIVE_NAMES,
+        max_round=NUM_ROUNDS,
+    )
 
 print("\nAll experiments finished. Plots saved.")
 
@@ -289,22 +371,47 @@ print("\nAll experiments finished. Plots saved.")
 def save_summary_to_txt(filename="结果.txt"):
     print(f"Saving summary to {filename}...")
 
-    # 计算模型总参数量 (Dense)
     total_params = sum(p.numel() for p in initial_model.parameters())
+    dense_single_kb = sum(v.cpu().numpy().nbytes for v in initial_model.state_dict().values()) / 1024
+    dense_upload_baseline_kb = dense_single_kb
+    dense_exchange_baseline_kb = 2 * dense_single_kb
+
+    if "None" in all_results:
+        none_metrics = all_results["None"]["client_metrics"]
+        none_uploads = [m.get("avg_upload_size_kb", 0.0) for m in none_metrics]
+        none_exchanges = [
+            m.get("avg_exchange_size_kb", m.get("avg_upload_size_kb", 0.0) + m.get("avg_download_size_kb", 0.0))
+            for m in none_metrics
+        ]
+        if none_uploads:
+            dense_upload_baseline_kb = sum(none_uploads) / len(none_uploads)
+        if none_exchanges:
+            dense_exchange_baseline_kb = sum(none_exchanges) / len(none_exchanges)
 
     with open(filename, "w", encoding="utf-8") as f:
-        f.write(f"实验结果汇总 (Experiment Summary)\n")
-        f.write(f"========================================\n")
+        f.write("Experiment Summary\n")
+        f.write("========================================\n")
         f.write(f"Dataset: {DATASET_NAME}\n")
         f.write(f"Model: {MODEL_NAME}\n")
         f.write(f"Total Dense Params: {total_params:,}\n")
         f.write(f"Clients: {NUM_CLIENTS}, Rounds: {NUM_ROUNDS}\n")
-        f.write(f"========================================\n\n")
+        f.write("========================================\n\n")
+        f.write(f"Dense baseline (single direction KB): {dense_upload_baseline_kb:.2f}\n")
+        f.write(f"Dense baseline (upload + download KB): {dense_exchange_baseline_kb:.2f}\n")
+        f.write("Upload Ratio = avg_upload_kb / dense_single_direction_kb\n")
+        f.write("Exchange Ratio = (avg_upload_kb + avg_download_kb) / dense_upload_download_kb\n\n")
 
-        # 表头
-        headers = ["Experiment", "Strategy", "Threshold", "Final Acc", "Best Acc", "Last Upload(KB)"]
-        # 格式化字符串
-        header_str = f"{headers[0]:<12} | {headers[1]:<15} | {headers[2]:<10} | {headers[3]:<10} | {headers[4]:<10} | {headers[5]:<15}"
+        headers = [
+            "Experiment", "Strategy", "Threshold", "Final Acc", "Best Acc",
+            "Last Upload(KB)", "Avg Upload(KB)", "Avg Download(KB)",
+            "Avg Exchange(KB)", "Upload Ratio", "Exchange Ratio",
+        ]
+        header_str = (
+            f"{headers[0]:<12} | {headers[1]:<15} | {headers[2]:<10} | "
+            f"{headers[3]:<10} | {headers[4]:<10} | {headers[5]:<15} | "
+            f"{headers[6]:<15} | {headers[7]:<16} | {headers[8]:<16} | "
+            f"{headers[9]:<13} | {headers[10]:<15}"
+        )
         f.write(header_str + "\n")
         f.write("-" * len(header_str) + "\n")
 
@@ -315,22 +422,34 @@ def save_summary_to_txt(filename="结果.txt"):
 
             strategy_name = exp["strategy"]
             threshold = exp["threshold"]
-
             results = all_results[name]
-            # 获取精度数据
             accuracies_data = results["global_accuracies"]
-            # accuracies_data 格式是 [(round, acc), ...]
             accuracies = [acc for _, acc in accuracies_data]
-
             final_acc = accuracies[-1] if accuracies else 0.0
             best_acc = max(accuracies) if accuracies else 0.0
 
-            # 获取通信开销数据
             metrics = results["client_metrics"]
             last_round_metric = metrics[-1] if metrics else {}
-            avg_upload = last_round_metric.get("avg_upload_size_kb", 0.0)
+            last_upload = last_round_metric.get("avg_upload_size_kb", 0.0)
+            upload_kbs = [m.get("avg_upload_size_kb", 0.0) for m in metrics]
+            download_kbs = [m.get("avg_download_size_kb", 0.0) for m in metrics]
+            exchange_kbs = [
+                m.get("avg_exchange_size_kb", m.get("avg_upload_size_kb", 0.0) + m.get("avg_download_size_kb", 0.0))
+                for m in metrics
+            ]
 
-            row_str = f"{name:<12} | {strategy_name:<15} | {str(threshold):<10} | {final_acc:.4f}     | {best_acc:.4f}     | {avg_upload:.2f}"
+            avg_upload = sum(upload_kbs) / len(upload_kbs) if upload_kbs else 0.0
+            avg_download = sum(download_kbs) / len(download_kbs) if download_kbs else 0.0
+            avg_exchange = sum(exchange_kbs) / len(exchange_kbs) if exchange_kbs else avg_upload + avg_download
+            upload_ratio = avg_upload / dense_upload_baseline_kb if dense_upload_baseline_kb > 0 else 0.0
+            exchange_ratio = avg_exchange / dense_exchange_baseline_kb if dense_exchange_baseline_kb > 0 else 0.0
+
+            row_str = (
+                f"{name:<12} | {strategy_name:<15} | {str(threshold):<10} | "
+                f"{final_acc:.4f}     | {best_acc:.4f}     | {last_upload:<15.2f} | "
+                f"{avg_upload:<15.2f} | {avg_download:<16.2f} | {avg_exchange:<16.2f} | "
+                f"{upload_ratio:<13.4f} | {exchange_ratio:<15.4f}"
+            )
             f.write(row_str + "\n")
 
     print(f"Summary saved to {filename}")

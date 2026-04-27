@@ -36,7 +36,7 @@ def calculate_mad(weights: np.ndarray) -> float:
 
 
 def apply_pruning(model: nn.Module, pruning_strategy: str, initial_weights_vector: np.ndarray = None,
-                  threshold_param: float = 0.9):
+                  threshold_param: float = 0.9, delta_mad_scale: float = 2.0):
     """
     根据不同的策略对模型参数进行剪枝。
     """
@@ -88,7 +88,7 @@ def apply_pruning(model: nn.Module, pruning_strategy: str, initial_weights_vecto
 
         # 1. Delta Mask
         delta_weights = np.abs(current_flat_weights - initial_weights_vector)
-        delta_mad_threshold = calculate_mad(delta_weights) * 3.0
+        delta_mad_threshold = calculate_mad(delta_weights) * delta_mad_scale
         change_mask = np.abs(delta_weights) >= delta_mad_threshold
 
         # 2. Magnitude Mask

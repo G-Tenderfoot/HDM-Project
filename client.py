@@ -187,6 +187,7 @@ class FlowerClient(fl.client.NumPyClient):
         # 优先读取 config，没有则读取 static_config
         pruning_strategy = config.get("pruning_strategy") or self.static_config.get("pruning_strategy", "none")
         threshold_param = config.get("threshold_param") or self.static_config.get("threshold_param", 0.0)
+        delta_mad_scale = config.get("delta_mad_scale") or self.static_config.get("delta_mad_scale", 2.0)
 
         # === 修复点：Round 0 初始化保护 ===
         # 如果是第一次获取参数（Round 0），或者还没有初始权重向量，
@@ -201,7 +202,8 @@ class FlowerClient(fl.client.NumPyClient):
             self.net,
             pruning_strategy=actual_strategy,  # <--- 这里使用安全策略
             initial_weights_vector=self._initial_global_weights_vector,
-            threshold_param=threshold_param
+            threshold_param=threshold_param,
+            delta_mad_scale=delta_mad_scale
         )
 
         params_list, _ = state_dict_to_sparse_representation_for_upload(pruned_state_dict)
@@ -240,6 +242,7 @@ class FlowerClient(fl.client.NumPyClient):
         
         epochs = config.get("epochs", 2)
         learning_rate = config.get("learning_rate", 0.01)
+        client_momentum = config.get("client_momentum", 0.9)
         server_round = config.get("server_round", 0)
 
         # 处理没有数据的客户端
@@ -251,7 +254,12 @@ class FlowerClient(fl.client.NumPyClient):
             return current_params, 0, {"fit_duration": 0.0, "upload_size_bytes": upload_size}
 
         # 本地训练循环
-        optimizer = SGD(self.net.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-4)
+        optimizer = SGD(
+            self.net.parameters(),
+            lr=learning_rate,
+            momentum=client_momentum,
+            weight_decay=1e-4,
+        )
         criterion = nn.CrossEntropyLoss()
         
         self.net.train()
@@ -271,10 +279,11 @@ class FlowerClient(fl.client.NumPyClient):
         # 训练结束后，不要调用 get_parameters。
         # 直接在这里完成剪枝和打包，以同时获得参数和上传大小。
         pruned_state_dict = apply_pruning(
-            self.net, 
-            pruning_strategy=config.get("pruning_strategy", "none"), 
+            self.net,
+            pruning_strategy=config.get("pruning_strategy", "none"),
             initial_weights_vector=self._initial_global_weights_vector,
-            threshold_param=config.get("threshold_param", 0.9)
+            threshold_param=config.get("threshold_param", 0.9),
+            delta_mad_scale=config.get("delta_mad_scale", 2.0)
         )
         updated_params, upload_size = state_dict_to_sparse_representation_for_upload(pruned_state_dict)
         
