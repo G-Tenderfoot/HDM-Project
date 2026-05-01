@@ -52,15 +52,12 @@ def _flush_round(server_round: int):
 
 
 def record_fit_metrics(server_round: int, avg_fit_duration: float,
-                       avg_upload_size_kb: float,
-                       avg_download_size_kb: float = 0.0):
+                       avg_upload_size_kb: float):
     """aggregate_fit 结束时调用."""
     with _LOCK:
         entry = _ROUND_BUFFER.setdefault(server_round, {"round": server_round})
         entry["avg_fit_duration"] = avg_fit_duration
         entry["avg_upload_size_kb"] = avg_upload_size_kb
-        entry["avg_download_size_kb"] = avg_download_size_kb
-        entry["avg_exchange_size_kb"] = avg_upload_size_kb + avg_download_size_kb
 
 
 def record_eval_metrics(server_round: int, loss: float, accuracy: float):

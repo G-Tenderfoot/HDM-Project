@@ -67,11 +67,6 @@ def load_exp(name: str, records_dir: str, prefer_pkl: bool = False):
                 {
                     "round": r["round"],
                     "avg_upload_size_kb": r.get("avg_upload_size_kb", 0.0),
-                    "avg_download_size_kb": r.get("avg_download_size_kb", 0.0),
-                    "avg_exchange_size_kb": r.get(
-                        "avg_exchange_size_kb",
-                        r.get("avg_upload_size_kb", 0.0) + r.get("avg_download_size_kb", 0.0),
-                    ),
                     "avg_fit_duration": r.get("avg_fit_duration", 0.0),
                 }
                 for r in rows
@@ -122,16 +117,13 @@ def generate_plot(exp_data: dict, title: str, filename: str, max_round: int = No
         if not metrics:
             continue
         rounds = [m["round"] for m in metrics]
-        uploads = [
-            m.get("avg_exchange_size_kb", m.get("avg_upload_size_kb", 0.0) + m.get("avg_download_size_kb", 0.0))
-            for m in metrics
-        ]
+        uploads = [m.get("avg_upload_size_kb", 0.0) for m in metrics]
         if max_round is not None:
             pairs = [(r, u) for r, u in zip(rounds, uploads) if r <= max_round]
             rounds = [r for r, _ in pairs]
             uploads = [u for _, u in pairs]
         plt.plot(rounds, uploads, label=name, color=COLOR_MAP.get(name), linewidth=2)
-    plt.title(f"{only_name} Data Exchange per Client (KB)" if is_single else "Avg Data Exchange (KB)")
+    plt.title(f"{only_name} Upload Size per Client (KB)" if is_single else "Avg Upload Size (KB)")
     plt.xlabel("Rounds"); plt.grid(True); plt.legend()
 
     # Subplot 3: Fit Duration
@@ -157,46 +149,34 @@ def generate_plot(exp_data: dict, title: str, filename: str, max_round: int = No
 
 
 def generate_summary(exp_data: dict, records_dir: str, out_path: str):
-    """Rebuild a communication summary from records."""
-    dense_upload_baseline_kb = 0.0
-    dense_exchange_baseline_kb = 0.0
+    """从 records 重建 结果.txt, 用 None 作 dense baseline."""
+    # 计算 dense baseline
+    dense_baseline_kb = 0.0
     if "None" in exp_data:
         _, none_metrics = exp_data["None"]
-        none_uploads = [m.get("avg_upload_size_kb", 0.0) for m in none_metrics]
-        none_exchanges = [
-            m.get("avg_exchange_size_kb", m.get("avg_upload_size_kb", 0.0) + m.get("avg_download_size_kb", 0.0))
-            for m in none_metrics
-        ]
-        if none_uploads:
-            dense_upload_baseline_kb = sum(none_uploads) / len(none_uploads)
-        if none_exchanges:
-            dense_exchange_baseline_kb = sum(none_exchanges) / len(none_exchanges)
-    if dense_upload_baseline_kb <= 0.0:
+        none_kbs = [m.get("avg_upload_size_kb", 0.0) for m in none_metrics]
+        if none_kbs:
+            dense_baseline_kb = sum(none_kbs) / len(none_kbs)
+    if dense_baseline_kb <= 0.0:
         all_kbs = []
         for name in exp_data:
             _, metrics = exp_data[name]
             if metrics:
                 all_kbs.append(max(m.get("avg_upload_size_kb", 0.0) for m in metrics))
-        dense_upload_baseline_kb = max(all_kbs) if all_kbs else 1.0
-    if dense_exchange_baseline_kb <= 0.0:
-        dense_exchange_baseline_kb = 2 * dense_upload_baseline_kb
+        dense_baseline_kb = max(all_kbs) if all_kbs else 1.0
 
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("Experiment Summary - rebuilt from records\n")
+        f.write("实验结果汇总 (Experiment Summary) - 从 records 重建\n")
         f.write("========================================\n")
         f.write(f"Records dir: {records_dir}\n")
-        f.write(f"Dense baseline (single direction KB): {dense_upload_baseline_kb:.2f}\n")
-        f.write(f"Dense baseline (upload + download KB): {dense_exchange_baseline_kb:.2f}\n")
-        f.write("Upload Ratio = avg_upload_kb / dense_single_direction_kb\n")
-        f.write("Exchange Ratio = (avg_upload_kb + avg_download_kb) / dense_upload_download_kb\n")
+        f.write(f"Dense baseline (avg upload KB): {dense_baseline_kb:.2f}\n")
+        f.write("Ratio = avg_upload_kb / dense_baseline_kb\n")
         f.write("========================================\n\n")
 
         headers = ["Experiment", "Final Acc", "Best Acc",
-                   "Last Upload(KB)", "Avg Upload(KB)", "Avg Download(KB)",
-                   "Avg Exchange(KB)", "Upload Ratio", "Exchange Ratio"]
+                   "Last Upload(KB)", "Avg Upload(KB)", "Ratio(x dense)"]
         header_str = (f"{headers[0]:<12} | {headers[1]:<10} | {headers[2]:<10} | "
-                      f"{headers[3]:<15} | {headers[4]:<15} | {headers[5]:<16} | "
-                      f"{headers[6]:<16} | {headers[7]:<13} | {headers[8]:<15}")
+                      f"{headers[3]:<15} | {headers[4]:<15} | {headers[5]:<15}")
         f.write(header_str + "\n")
         f.write("-" * len(header_str) + "\n")
 
@@ -213,19 +193,10 @@ def generate_summary(exp_data: dict, records_dir: str, out_path: str):
             all_kbs = [m.get("avg_upload_size_kb", 0.0) for m in metrics]
             last_upload = all_kbs[-1] if all_kbs else 0.0
             avg_upload = sum(all_kbs) / len(all_kbs) if all_kbs else 0.0
-            download_kbs = [m.get("avg_download_size_kb", 0.0) for m in metrics]
-            avg_download = sum(download_kbs) / len(download_kbs) if download_kbs else 0.0
-            exchange_kbs = [
-                m.get("avg_exchange_size_kb", m.get("avg_upload_size_kb", 0.0) + m.get("avg_download_size_kb", 0.0))
-                for m in metrics
-            ]
-            avg_exchange = sum(exchange_kbs) / len(exchange_kbs) if exchange_kbs else avg_upload + avg_download
-            upload_ratio = avg_upload / dense_upload_baseline_kb if dense_upload_baseline_kb > 0 else 0.0
-            exchange_ratio = avg_exchange / dense_exchange_baseline_kb if dense_exchange_baseline_kb > 0 else 0.0
+            ratio = avg_upload / dense_baseline_kb if dense_baseline_kb > 0 else 0.0
 
             row = (f"{name:<12} | {final_acc:<10.4f} | {best_acc:<10.4f} | "
-                   f"{last_upload:<15.2f} | {avg_upload:<15.2f} | {avg_download:<16.2f} | "
-                   f"{avg_exchange:<16.2f} | {upload_ratio:<13.4f} | {exchange_ratio:<15.4f}")
+                   f"{last_upload:<15.2f} | {avg_upload:<15.2f} | {ratio:<15.4f}")
             f.write(row + "\n")
 
         # 也输出不在 order 里的实验
@@ -239,18 +210,9 @@ def generate_summary(exp_data: dict, records_dir: str, out_path: str):
             all_kbs = [m.get("avg_upload_size_kb", 0.0) for m in metrics]
             last_upload = all_kbs[-1] if all_kbs else 0.0
             avg_upload = sum(all_kbs) / len(all_kbs) if all_kbs else 0.0
-            download_kbs = [m.get("avg_download_size_kb", 0.0) for m in metrics]
-            avg_download = sum(download_kbs) / len(download_kbs) if download_kbs else 0.0
-            exchange_kbs = [
-                m.get("avg_exchange_size_kb", m.get("avg_upload_size_kb", 0.0) + m.get("avg_download_size_kb", 0.0))
-                for m in metrics
-            ]
-            avg_exchange = sum(exchange_kbs) / len(exchange_kbs) if exchange_kbs else avg_upload + avg_download
-            upload_ratio = avg_upload / dense_upload_baseline_kb if dense_upload_baseline_kb > 0 else 0.0
-            exchange_ratio = avg_exchange / dense_exchange_baseline_kb if dense_exchange_baseline_kb > 0 else 0.0
+            ratio = avg_upload / dense_baseline_kb if dense_baseline_kb > 0 else 0.0
             row = (f"{name:<12} | {final_acc:<10.4f} | {best_acc:<10.4f} | "
-                   f"{last_upload:<15.2f} | {avg_upload:<15.2f} | {avg_download:<16.2f} | "
-                   f"{avg_exchange:<16.2f} | {upload_ratio:<13.4f} | {exchange_ratio:<15.4f}")
+                   f"{last_upload:<15.2f} | {avg_upload:<15.2f} | {ratio:<15.4f}")
             f.write(row + "\n")
 
     print(f"Summary saved: {out_path}")

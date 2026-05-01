@@ -208,8 +208,6 @@ for exp in ACTIVE_EXPERIMENTS:
         },
         strategy_config={
             "server_momentum_beta": exp.get("server_momentum_beta", 0.0),
-            "delta_mad_scale": delta_mad_scale_val,
-            "sparse_downlink": True,
         },
     )
 
@@ -295,13 +293,10 @@ def generate_plot(title, filename, strategies_to_show, max_round):
         data = all_results[name]
         metrics = data["client_metrics"]
         rounds = [m["round"] for m in metrics if m["round"] <= max_round]
-        exchanges = [
-            m.get("avg_exchange_size_kb", m.get("avg_upload_size_kb", 0.0) + m.get("avg_download_size_kb", 0.0))
-            for m in metrics
-        ][:len(rounds)]
-        plt.plot(rounds, exchanges, label=name, color=exp_conf["color"], linewidth=2)
+        uploads = [m["avg_upload_size_kb"] for m in metrics][:len(rounds)]
+        plt.plot(rounds, uploads, label=name, color=exp_conf["color"], linewidth=2)
 
-    plt.title(f"{only_name} Data Exchange per Client (KB)" if is_single else "Avg Data Exchange (KB)")
+    plt.title(f"{only_name} Upload Size per Client (KB)" if is_single else "Avg Upload Size (KB)")
     plt.xlabel("Rounds"); plt.grid(True); plt.legend()
 
     # 子图3: Fit Duration
@@ -371,47 +366,44 @@ print("\nAll experiments finished. Plots saved.")
 def save_summary_to_txt(filename="结果.txt"):
     print(f"Saving summary to {filename}...")
 
+    # 计算模型总参数量 (Dense)
     total_params = sum(p.numel() for p in initial_model.parameters())
-    dense_single_kb = sum(v.cpu().numpy().nbytes for v in initial_model.state_dict().values()) / 1024
-    dense_upload_baseline_kb = dense_single_kb
-    dense_exchange_baseline_kb = 2 * dense_single_kb
-
-    if "None" in all_results:
-        none_metrics = all_results["None"]["client_metrics"]
-        none_uploads = [m.get("avg_upload_size_kb", 0.0) for m in none_metrics]
-        none_exchanges = [
-            m.get("avg_exchange_size_kb", m.get("avg_upload_size_kb", 0.0) + m.get("avg_download_size_kb", 0.0))
-            for m in none_metrics
-        ]
-        if none_uploads:
-            dense_upload_baseline_kb = sum(none_uploads) / len(none_uploads)
-        if none_exchanges:
-            dense_exchange_baseline_kb = sum(none_exchanges) / len(none_exchanges)
 
     with open(filename, "w", encoding="utf-8") as f:
-        f.write("Experiment Summary\n")
-        f.write("========================================\n")
+        f.write(f"实验结果汇总 (Experiment Summary)\n")
+        f.write(f"========================================\n")
         f.write(f"Dataset: {DATASET_NAME}\n")
         f.write(f"Model: {MODEL_NAME}\n")
         f.write(f"Total Dense Params: {total_params:,}\n")
         f.write(f"Clients: {NUM_CLIENTS}, Rounds: {NUM_ROUNDS}\n")
-        f.write("========================================\n\n")
-        f.write(f"Dense baseline (single direction KB): {dense_upload_baseline_kb:.2f}\n")
-        f.write(f"Dense baseline (upload + download KB): {dense_exchange_baseline_kb:.2f}\n")
-        f.write("Upload Ratio = avg_upload_kb / dense_single_direction_kb\n")
-        f.write("Exchange Ratio = (avg_upload_kb + avg_download_kb) / dense_upload_download_kb\n\n")
+        f.write(f"========================================\n\n")
 
-        headers = [
-            "Experiment", "Strategy", "Threshold", "Final Acc", "Best Acc",
-            "Last Upload(KB)", "Avg Upload(KB)", "Avg Download(KB)",
-            "Avg Exchange(KB)", "Upload Ratio", "Exchange Ratio",
-        ]
-        header_str = (
-            f"{headers[0]:<12} | {headers[1]:<15} | {headers[2]:<10} | "
-            f"{headers[3]:<10} | {headers[4]:<10} | {headers[5]:<15} | "
-            f"{headers[6]:<15} | {headers[7]:<16} | {headers[8]:<16} | "
-            f"{headers[9]:<13} | {headers[10]:<15}"
-        )
+        # 先计算 dense baseline (None 策略) 的平均上传 KB, 用作 ratio 分母
+        # 优先取整轮平均, 没有 None 则回退到 last-round max
+        dense_baseline_kb = 0.0
+        if "None" in all_results:
+            none_metrics = all_results["None"]["client_metrics"]
+            none_kbs = [m.get("avg_upload_size_kb", 0.0) for m in none_metrics]
+            if none_kbs:
+                dense_baseline_kb = sum(none_kbs) / len(none_kbs)
+        if dense_baseline_kb <= 0.0:
+            # 回退: 取所有实验中最大的上传 KB 作为近似 dense
+            all_last_kbs = []
+            for n in all_results:
+                m = all_results[n]["client_metrics"]
+                if m:
+                    all_last_kbs.append(m[-1].get("avg_upload_size_kb", 0.0))
+            dense_baseline_kb = max(all_last_kbs) if all_last_kbs else 1.0
+
+        f.write(f"Dense baseline (avg upload KB): {dense_baseline_kb:.2f}\n")
+        f.write("Ratio = avg_upload_kb / dense_baseline_kb  (用于与 FedMef/FedRTS 的 Data Exchange ratio 跨论文对比)\n\n")
+
+        # 表头 (新增 Avg Upload 和 Ratio 两列)
+        headers = ["Experiment", "Strategy", "Threshold", "Final Acc", "Best Acc",
+                   "Last Upload(KB)", "Avg Upload(KB)", "Ratio(x dense)"]
+        header_str = (f"{headers[0]:<12} | {headers[1]:<15} | {headers[2]:<10} | "
+                      f"{headers[3]:<10} | {headers[4]:<10} | {headers[5]:<15} | "
+                      f"{headers[6]:<15} | {headers[7]:<15}")
         f.write(header_str + "\n")
         f.write("-" * len(header_str) + "\n")
 
@@ -422,34 +414,28 @@ def save_summary_to_txt(filename="结果.txt"):
 
             strategy_name = exp["strategy"]
             threshold = exp["threshold"]
+
             results = all_results[name]
+            # 获取精度数据
             accuracies_data = results["global_accuracies"]
             accuracies = [acc for _, acc in accuracies_data]
+
             final_acc = accuracies[-1] if accuracies else 0.0
             best_acc = max(accuracies) if accuracies else 0.0
 
+            # 通信开销
             metrics = results["client_metrics"]
             last_round_metric = metrics[-1] if metrics else {}
             last_upload = last_round_metric.get("avg_upload_size_kb", 0.0)
-            upload_kbs = [m.get("avg_upload_size_kb", 0.0) for m in metrics]
-            download_kbs = [m.get("avg_download_size_kb", 0.0) for m in metrics]
-            exchange_kbs = [
-                m.get("avg_exchange_size_kb", m.get("avg_upload_size_kb", 0.0) + m.get("avg_download_size_kb", 0.0))
-                for m in metrics
-            ]
 
-            avg_upload = sum(upload_kbs) / len(upload_kbs) if upload_kbs else 0.0
-            avg_download = sum(download_kbs) / len(download_kbs) if download_kbs else 0.0
-            avg_exchange = sum(exchange_kbs) / len(exchange_kbs) if exchange_kbs else avg_upload + avg_download
-            upload_ratio = avg_upload / dense_upload_baseline_kb if dense_upload_baseline_kb > 0 else 0.0
-            exchange_ratio = avg_exchange / dense_exchange_baseline_kb if dense_exchange_baseline_kb > 0 else 0.0
+            all_kbs = [m.get("avg_upload_size_kb", 0.0) for m in metrics]
+            avg_upload = sum(all_kbs) / len(all_kbs) if all_kbs else 0.0
 
-            row_str = (
-                f"{name:<12} | {strategy_name:<15} | {str(threshold):<10} | "
-                f"{final_acc:.4f}     | {best_acc:.4f}     | {last_upload:<15.2f} | "
-                f"{avg_upload:<15.2f} | {avg_download:<16.2f} | {avg_exchange:<16.2f} | "
-                f"{upload_ratio:<13.4f} | {exchange_ratio:<15.4f}"
-            )
+            ratio = avg_upload / dense_baseline_kb if dense_baseline_kb > 0 else 0.0
+
+            row_str = (f"{name:<12} | {strategy_name:<15} | {str(threshold):<10} | "
+                       f"{final_acc:.4f}     | {best_acc:.4f}     | {last_upload:<15.2f} | "
+                       f"{avg_upload:<15.2f} | {ratio:<15.4f}")
             f.write(row_str + "\n")
 
     print(f"Summary saved to {filename}")

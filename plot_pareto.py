@@ -12,23 +12,22 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # -- Data --
-# Current bidirectional sparse upload+download results:
-# (ExchangeRatio, best accuracy, label)
+# HDM configs: (ratio, best_acc, label)
 HDM_POINTS = [
-    (1.0000, 90.73, "FedAvg (Dense)"),
-    (0.3085, 87.81, "HDM (0.90+2.0)"),
-    (0.2441, 87.09, "HDM (0.92+2.5)"),
-    (0.1370, 84.72, "HDM (0.96+3.0)"),
-    (0.1126, 81.60, "HDM (0.97+4.0)"),
-    (0.1068, 79.05, "HDM (0.98+4.0)"),
-    (0.0508, 75.78, "HDM (0.985+4.0)"),
+    (1.000, 90.73, "FedAvg (Dense)"),
+    (0.494, 89.02, "HDM (0.75+3.0)"),
+    (0.418, 87.82, "HDM (0.85+2.0)"),
+    (0.376, 82.51, "HDM (0.88+2.0)"),
+    (0.343, 83.39, "HDM (0.90+2.0)"),
+    (0.271, 77.89, "HDM (0.92+2.5)"),
+    (0.196, 78.49, "HDM (0.95+3.0)"),
 ]
 
-# Literature baselines under the aligned ResNet-18/CIFAR-10 setup.
+# Literature baselines (same setup: ResNet-18, CIFAR-10, alpha=0.5, s_tm=0.8)
 LIT_POINTS = [
-    (0.086, 73.60, "FedMef 95%"),
-    (0.138, 78.10, "FedMef 90%"),
-    (0.243, 81.70, "FedMef 80%"),
+    (0.232, 79.7,  "FedDST"),
+    (0.243, 80.3,  "FedTiny"),
+    (0.243, 81.7,  "FedMef"),
     (0.233, 73.41, "FedRTS"),
 ]
 
@@ -60,21 +59,15 @@ def main():
         if label == "FedAvg (Dense)":
             continue
         short = label.replace("HDM ", "")
-        if "0.985" in label:
+        if "0.88" in label:
             ax.annotate(short, (x, y), textcoords="offset points",
-                        xytext=(7, -3), fontsize=7, color="tab:purple")
-        elif "0.98" in label:
+                        xytext=(-45, -8), fontsize=7, color="tab:purple")
+        elif "0.95" in label:
             ax.annotate(short, (x, y), textcoords="offset points",
-                        xytext=(7, 3), fontsize=7, color="tab:purple")
-        elif "0.97" in label:
-            ax.annotate(short, (x, y), textcoords="offset points",
-                        xytext=(8, -10), fontsize=7, color="tab:purple")
+                        xytext=(-50, 5), fontsize=7, color="tab:purple")
         elif "0.92" in label:
-            ax.annotate("(0.92+2.5)", (x, y), textcoords="offset points",
-                        xytext=(8, -8), fontsize=7, color="tab:purple")
-        elif "0.96" in label:
             ax.annotate(short, (x, y), textcoords="offset points",
-                        xytext=(8, 6), fontsize=7, color="tab:purple")
+                        xytext=(8, -8), fontsize=7, color="tab:purple")
         else:
             ax.annotate(short, (x, y), textcoords="offset points",
                         xytext=(8, 5), fontsize=7, color="tab:purple")
@@ -86,21 +79,19 @@ def main():
                 xytext=(-40, -12), fontsize=8, color="tab:blue")
 
     # -- Literature baselines --
-    markers = {"FedMef 95%": "D", "FedMef 90%": "D",
-               "FedMef 80%": "D", "FedRTS": "X"}
-    colors  = {"FedMef 95%": "tab:orange", "FedMef 90%": "tab:orange",
-               "FedMef 80%": "tab:orange", "FedRTS": "tab:red"}
+    markers = {"FedDST": "^", "FedTiny": "v", "FedMef": "D", "FedRTS": "X"}
+    colors  = {"FedDST": "tab:green", "FedTiny": "tab:cyan",
+               "FedMef": "tab:orange", "FedRTS": "tab:red"}
     for x, y, name in LIT_POINTS:
         ax.plot(x, y, markers[name], color=colors[name], markersize=9,
                 label=name, zorder=6)
-        offset = (8, -2) if name != "FedRTS" else (8, -12)
-        ax.annotate(f"{name}\n{y:.1f}%", (x, y), textcoords="offset points",
-                    xytext=offset, fontsize=7, color=colors[name])
+        ax.annotate(f"{name}\n{y}%", (x, y), textcoords="offset points",
+                    xytext=(8, -2), fontsize=7, color=colors[name])
 
     # -- Formatting --
     ax.set_xlabel(r"Communication Ratio ($\times$ dense)", fontsize=11)
     ax.set_ylabel("Best Accuracy (%)", fontsize=11)
-    ax.set_xlim(0.03, 1.08)
+    ax.set_xlim(0.15, 1.08)
     ax.set_ylim(70, 93)
     ax.grid(True, alpha=0.3)
     ax.legend(loc="lower right", fontsize=8, framealpha=0.9)

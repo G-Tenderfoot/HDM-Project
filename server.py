@@ -7,12 +7,7 @@ from collections import OrderedDict
 from scipy.sparse import csr_matrix
 
 from models import CNN, MnistCNN, ResNet18, ResNet20
-from pruning_utils import (
-    apply_pruning,
-    get_parameters_as_vector,
-    sparse_representation_to_state_dict_from_download,
-    state_dict_to_sparse_representation_for_upload,
-)
+from pruning_utils import sparse_representation_to_state_dict_from_download
 from client import load_datasets
 import recorder
 
@@ -54,9 +49,6 @@ class PruningFedAvg(fl.server.strategy.FedAvg):
 
         self.metrics_aggregated_per_round = []
         self.server_momentum_beta = self.strategy_config.get("server_momentum_beta", 0.0)
-        self.delta_mad_scale = self.strategy_config.get("delta_mad_scale", 2.0)
-        self.sparse_downlink = self.strategy_config.get("sparse_downlink", True)
-        self.last_downlink_size_kb = 0.0
         self.momentum_buffer = None
         self.current_global_weights = (
             [np.array(arr, copy=True) for arr in fl.common.parameters_to_ndarrays(initial_parameters)]
@@ -96,90 +88,13 @@ class PruningFedAvg(fl.server.strategy.FedAvg):
             state_dict[key] = tensor
         return state_dict
 
-    def _state_dict_to_ndarrays(self, state_dict: OrderedDict) -> list[np.ndarray]:
-        return [value.cpu().numpy() for value in state_dict.values()]
-
-    def _dense_size_bytes(self, ndarrays: list[np.ndarray]) -> int:
-        return int(sum(np.asarray(array).nbytes for array in ndarrays))
-
-    def _build_model_from_ndarrays(
-        self,
-        ndarrays: list[np.ndarray],
-        reference_state_dict: OrderedDict,
-    ) -> nn.Module:
-        model = self._get_temp_model()
-        state_dict = self._ndarrays_to_reference_state_dict(ndarrays, reference_state_dict)
-        model.load_state_dict(state_dict, strict=True)
-        return model
-
-    def _apply_server_side_pruning(
-        self,
-        ndarrays: list[np.ndarray],
-        base_weights: list[np.ndarray] | None,
-        reference_state_dict: OrderedDict,
-    ) -> list[np.ndarray]:
-        if (not self.sparse_downlink) or self.pruning_strategy == "none":
-            return ndarrays
-
-        model = self._build_model_from_ndarrays(ndarrays, reference_state_dict)
-        initial_weights_vector = None
-
-        if self.pruning_strategy in ("hdm_prun", "delta_prun_mad"):
-            if base_weights is None:
-                return ndarrays
-            base_model = self._build_model_from_ndarrays(base_weights, reference_state_dict)
-            initial_weights_vector = get_parameters_as_vector(base_model)
-
-        pruned_state_dict = apply_pruning(
-            model,
-            pruning_strategy=self.pruning_strategy,
-            initial_weights_vector=initial_weights_vector,
-            threshold_param=self.threshold_param,
-            delta_mad_scale=self.delta_mad_scale,
-        )
-        return self._state_dict_to_ndarrays(pruned_state_dict)
-
-    def _apply_initial_downlink_pruning(
-        self,
-        ndarrays: list[np.ndarray],
-        reference_state_dict: OrderedDict,
-    ) -> list[np.ndarray]:
-        if (not self.sparse_downlink) or self.pruning_strategy == "none":
-            return ndarrays
-
-        initial_strategy = self.pruning_strategy
-        if initial_strategy in ("hdm_prun", "delta_prun_mad"):
-            initial_strategy = "magnitude"
-
-        model = self._build_model_from_ndarrays(ndarrays, reference_state_dict)
-        pruned_state_dict = apply_pruning(
-            model,
-            pruning_strategy=initial_strategy,
-            initial_weights_vector=None,
-            threshold_param=self.threshold_param,
-            delta_mad_scale=self.delta_mad_scale,
-        )
-        return self._state_dict_to_ndarrays(pruned_state_dict)
-
-    def _make_downlink_parameters(
-        self,
-        ndarrays: list[np.ndarray],
-        reference_state_dict: OrderedDict,
-    ) -> tuple[fl.common.Parameters, float]:
-        if (not self.sparse_downlink) or self.pruning_strategy == "none":
-            return fl.common.ndarrays_to_parameters(ndarrays), self._dense_size_bytes(ndarrays) / 1024
-
-        state_dict = self._ndarrays_to_reference_state_dict(ndarrays, reference_state_dict)
-        sparse_params, downlink_size_bytes = state_dict_to_sparse_representation_for_upload(state_dict)
-        return fl.common.ndarrays_to_parameters(sparse_params), downlink_size_bytes / 1024
-
     def _decode_uploaded_parameters(
         self,
         parameters: list[np.ndarray],
         reference_state_dict: OrderedDict,
         base_state_dict: OrderedDict | None = None,
     ) -> OrderedDict:
-        """Decode client uploads. Missing sparse coordinates remain zero unless a base state is provided."""
+        """Decode client uploads and keep previous global values on missing sparse coordinates."""
         state_dict = OrderedDict()
         state_keys = list(reference_state_dict.keys())
         param_idx = 0
@@ -298,18 +213,6 @@ class PruningFedAvg(fl.server.strategy.FedAvg):
 
         temp_model = self._get_temp_model()
         temp_model.load_state_dict(state_dict, strict=True)
-        broadcast_ndarrays = self._state_dict_to_ndarrays(state_dict)
-        if server_round == 1:
-            broadcast_ndarrays = self._apply_initial_downlink_pruning(
-                broadcast_ndarrays,
-                reference_state_dict,
-            )
-            self.current_global_weights = [np.array(arr, copy=True) for arr in broadcast_ndarrays]
-        broadcast_parameters, downlink_size_kb = self._make_downlink_parameters(
-            broadcast_ndarrays,
-            reference_state_dict,
-        )
-        self.last_downlink_size_kb = downlink_size_kb
 
         config = {}
         if self.on_fit_config_fn is not None:
@@ -319,7 +222,7 @@ class PruningFedAvg(fl.server.strategy.FedAvg):
         config["threshold_param"] = self.threshold_param
         config["server_round"] = server_round
 
-        fit_ins = fl.common.FitIns(broadcast_parameters, config)
+        fit_ins = fl.common.FitIns(parameters, config)
         clients = client_manager.sample(
             num_clients=self.min_fit_clients, min_num_clients=self.min_fit_clients
         )
@@ -349,14 +252,14 @@ class PruningFedAvg(fl.server.strategy.FedAvg):
 
         avg_fit_duration = np.mean(fit_durations) if fit_durations else 0
         avg_upload_size_kb = np.mean(upload_sizes_kb) if upload_sizes_kb else 0
-        avg_download_size_kb = self.last_downlink_size_kb
-        avg_exchange_size_kb = avg_upload_size_kb + avg_download_size_kb
 
         reference_state_dict, temp_model_keys, trainable_keys = self._get_model_metadata()
-        base_weights_for_round = (
-            [np.array(arr, copy=True) for arr in self.current_global_weights]
-            if self.current_global_weights is not None else None
-        )
+        base_state_dict = None
+        if self.current_global_weights is not None:
+            base_state_dict = self._ndarrays_to_reference_state_dict(
+                self.current_global_weights,
+                reference_state_dict,
+            )
 
         decoded_results_for_agg = []
         for client_proxy, fit_res in results:
@@ -364,7 +267,7 @@ class PruningFedAvg(fl.server.strategy.FedAvg):
             decoded_state_dict = self._decode_uploaded_parameters(
                 params_list,
                 reference_state_dict,
-                base_state_dict=None,
+                base_state_dict=base_state_dict,
             )
             dense_ndarrays = [val.cpu().numpy() for val in decoded_state_dict.values()]
 
@@ -387,23 +290,18 @@ class PruningFedAvg(fl.server.strategy.FedAvg):
             aggregated_ndarrays = self._sanitize_ndarrays(
                 aggregated_ndarrays,
                 temp_model_keys,
-                base_weights=base_weights_for_round,
+                base_weights=self.current_global_weights,
             )
             aggregated_ndarrays = self._apply_server_momentum(
                 aggregated_ndarrays,
-                base_weights_for_round,
+                self.current_global_weights,
                 temp_model_keys,
                 trainable_keys,
             )
             aggregated_ndarrays = self._sanitize_ndarrays(
                 aggregated_ndarrays,
                 temp_model_keys,
-                base_weights=base_weights_for_round,
-            )
-            aggregated_ndarrays = self._apply_server_side_pruning(
-                aggregated_ndarrays,
-                base_weights_for_round,
-                reference_state_dict,
+                base_weights=self.current_global_weights,
             )
             aggregated_parameters = fl.common.ndarrays_to_parameters(aggregated_ndarrays)
             self.current_global_weights = [np.array(arr, copy=True) for arr in aggregated_ndarrays]
@@ -413,21 +311,12 @@ class PruningFedAvg(fl.server.strategy.FedAvg):
                 "round": server_round,
                 "avg_fit_duration": avg_fit_duration,
                 "avg_upload_size_kb": avg_upload_size_kb,
-                "avg_download_size_kb": avg_download_size_kb,
-                "avg_exchange_size_kb": avg_exchange_size_kb,
             }
         )
-        recorder.record_fit_metrics(
-            server_round,
-            avg_fit_duration,
-            avg_upload_size_kb,
-            avg_download_size_kb,
-        )
+        recorder.record_fit_metrics(server_round, avg_fit_duration, avg_upload_size_kb)
         print(
             f"Server - Round {server_round} Aggregated - "
-            f"Avg Fit: {avg_fit_duration:.2f}s, "
-            f"Avg Upload: {avg_upload_size_kb:.2f}KB, "
-            f"Avg Download: {avg_download_size_kb:.2f}KB"
+            f"Avg Fit: {avg_fit_duration:.2f}s, Avg Upload: {avg_upload_size_kb:.2f}KB"
         )
         return aggregated_parameters, metrics_aggregated
 
